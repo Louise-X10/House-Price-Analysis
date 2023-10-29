@@ -1,0 +1,671 @@
+---
+title: "Draft report"
+output: pdf_document
+date: "2022-11-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(moderndive)
+library(tidyverse)
+library(GGally)
+library(skimr)
+library(leaps) # regsubsets
+library(caret)
+library(yardstick)
+library(rpart) # trees
+library(randomForest)
+library(gglasso)
+library(glmnet)
+```
+
+## Data Pre-processing
+
+  Our dataset is the Ames Housing dataset compiled by Dean De Cock for use in data science education. These data were gathered from Ames Iowa during a period spanning 2006 to 2010. The observational unit is a house sold in Ames from 2006 to 2010. The response variable, house sale price, is quantitative. The dataset includes 79 predictor features, with more than half of our predictors categorical. The predictors range from geographical information about the property and the neighborhood, to interior measurements and quality of amenities, to sales statistics. The dataset has 1460 observations. We found this dataset through the “House Prices - Advanced Regression Techniques” Kaggle competition, available [here](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/).
+  
+  Several important steps were taken in order to prepare this dataframe for our statistical analysis. The first step was recoding NA’s. In the raw .csv file, many of the categorical variables took the value NA frequently. Upon reading the codebook, it became clear that in many of the variables, the value NA actually stored meaning. Hence, whenever NA was listed as a possible value storing meaning for a categorical variable in the codebook, we replaced the value NA with the character value “None” so that our algorithms would not treat these NAs as missing data. Next, the continuous variable `LotFrontage` contained a large number of NA values. This variable records the length of street/sidewalk bordering a home. After some exploratory analysis, it became clear that instead of recording “no access” as 0, it was recorded as an NA. Hence, we recoded NA as 0 in LotFrontage. In any case where the codebook indicated that a variable which took numerical values should be interpreted as categorical (variables such as house legal subclass and month sold), we changed the variable type to character.
+  
+  The next issue to be addressed was rare levels. Some of the categorical features contained levels that were exceedingly rare. In extreme cases, levels were observed only once or twice. This imbalance in levels created issues in data splitting both for cross validation and for the validation set. Since the problem was so acute, even stratified sampling was not an option. Our solution was to combine the rare levels into a single level “other.” We set a threshold of 10 observations in a level. Levels with fewer than ten observations were collapsed into the single “other” category. This solution was designed to balance functionality with the desire to preserve the original data structure. Ten observations in each level gives an expected number of 2.5 observations in each level in the test set and 7.5 in the training set, which means that we likely will have at least one observation from each level in the training set and test set. When all levels within the test set are contained in the training set, our models will be able to make predictions on the test data, which will enable us to draw conclusions about relative model performance. 
+  
+  Even when combining rare levels into one “other” category, there were still categorical variables in which the other variable had less than 10 observations. These rare instances created the same issues with CV and in the training test split, so it was decided that these rare “other” values would be overwritten with the mode of the categorical variable. These rare observations reflect less than 0.68% of the observations in each level, so the alteration to the data from imputing was not at all substantial. To prevent data leakage, when we imputed the mode, we imputed the training mode for training observations and the test mode for test observations. If imputation created a variable that only took one single value, then that variable was removed from the whole dataset. This occurred for the variables `Street`, `Utilities`, and `PoolQC`. 
+  
+  After handling the rare values, there were still some variables which had to be cleaned up. The variable `GarageYrBlt` records the year that the home’s garage was built. If the home did not have a garage, this value was stored as NA. There were 81 of these values which is about 5% of the overall rows. For these NA’s, we imputed the mean (for the test and training sets), as not to have these rows discarded. Next, the variables recording Masonry Veneer Type and Masonry Veneer Area had 8 missing values for the same 8 rows. The mode of “none” (across both sets!) was imputed for Veneer Type and the value corresponding to “none,” 0, was imputed for the Veneer Area. Finally the one remaining categorical variable which truly did take NA values (the NA only stored the information that the data were missing), `Electrical`, took only one NA value and the mode value of the set it landed in was imputed here. 
+  
+  One specter looming over all of this data processing is cluster analysis. A more theoretically justified and effective way to deal with the rare levels phenomenon and collapse the dimensions on our dataframe could be PCA for mixed data (or an analogous decomposition through cluster analysis). By isolating principal components, many of the issues with high dimensionality and rare levels would be resolved and our models would likely be more effective. Unfortunately, we have yet to reach these methods in class, and the authors haven’t had too much time outside of class to learn about these methods. The “other” recoding method was the most effective strategy we could come up with using the tools that we have learned about in class. If we learn about cluster analysis and PCA in time for the final presentation, we will test the best performing method on the processed data (as uncovered in this report) on principal components to see if it performs better.
+
+
+```{r}
+train_raw <- read_csv("train.csv", show_col_types = FALSE)
+```
+
+
+```{r preprocess data, echo=FALSE, show_col_types = FALSE}
+#Recode NA’s as character values
+train_df <- train_raw %>% 
+  select(-Id) %>% 
+  mutate(Alley = ifelse(is.na(Alley), "None", Alley),
+         FireplaceQu = ifelse(is.na(FireplaceQu), "None", FireplaceQu),
+         PoolQC = ifelse(is.na(PoolQC),  "None", PoolQC),
+         Fence = ifelse(is.na(Fence), "None", Fence),
+         MiscFeature = ifelse(is.na(MiscFeature), "None", MiscFeature),
+         BsmtQual = ifelse(is.na(BsmtQual), "None", BsmtQual),
+         BsmtCond = ifelse(is.na(BsmtCond), "None", BsmtCond),
+         BsmtExposure = ifelse(is.na(BsmtExposure), "None", BsmtExposure),
+         BsmtFinType1 = ifelse(is.na(BsmtFinType1), "None", BsmtFinType1),
+         BsmtFinType2 = ifelse(is.na(BsmtFinType2), "None", BsmtFinType2),
+         GarageType = ifelse(is.na(GarageType), "None", GarageType),
+         GarageFinish = ifelse(is.na(GarageFinish), "None", GarageFinish),
+         GarageQual = ifelse(is.na(GarageQual), "None", GarageQual),
+         GarageCond = ifelse(is.na(GarageCond), "None", GarageCond),
+         # YrSold = as.character(YrSold),
+          MoSold = as.character(MoSold),
+         # YearBuilt = as.character(YearBuilt),
+         # YearRemodAdd = as.character(YearRemodAdd)
+         MSSubClass = as.character(MSSubClass)
+) %>%  
+  rename("X1stFlrSF"= `1stFlrSF`) %>% 
+  rename("X2ndFlrSF"= `2ndFlrSF`) %>% 
+  rename("X3SsnPorch"= `3SsnPorch`)
+
+#Change NAs in LotFrontage to zeroes
+train_df<-train_df %>% 
+  mutate(LotFrontage = ifelse(is.na(LotFrontage), 0,LotFrontage)
+)
+```
+
+```{r otherify and modeify, echo=FALSE}
+Mode <- function(x) {
+ux <- unique(x)
+ux[which.max(tabulate(match(x, ux)))]
+}
+
+otherify<-function(df, k, mode_rep){
+  names<-df %>% 
+    select_if(negate(is.numeric)) %>% 
+    names()
+  # d: each dummy counts number of obs in each level
+  # names-vecs: each entry is a list of the levels with count <=k
+  d<-list()
+  names_vecs<-list()
+  for (i in 1:length(names)){
+    dummy<-df %>% 
+      group_by(.[[paste(names[i])]]) %>% 
+      summarise(count=n()) 
+  names(dummy)=c(names[i],"count")
+  
+  d[[i]]<-dummy
+  
+  names_vecs[[i]]<-dummy %>% 
+    filter(count<=k) %>% 
+    select(-count) %>% 
+    pull()
+  }
+  
+  for (i in 1:length(names)){
+    df[[names[i]]]=ifelse(df[[names[i]]]%in%names_vecs[[i]],"other",df[[names[i]]])
+  }
+  
+  if (mode_rep==T){
+    for (i in 1:length(names)){
+      s<-sum(df[,names[i]]=="other")
+      if ((s!=0)&(s<k)){
+        df[[names[i]]]=ifelse(df[[names[i]]]=="other",
+                         Mode(df[[names[i]]]),
+                         df[[names[i]]])
+      }
+    }
+  }
+  
+  return(df)
+}
+
+modeify<-function(df, k){
+  names<-df %>% 
+    select_if(negate(is.numeric)) %>% 
+    names()
+  for (i in 1:length(names)){
+      s<-sum(df[,names[i]]=="other")
+      if ((s!=0)&(s<=k)){
+        df[[names[i]]]=ifelse(df[[names[i]]]=="other",
+                         Mode(df[[names[i]]]),
+                         df[[names[i]]])
+      }
+  }
+  return(df)
+}
+```
+
+```{r train test split, echo=FALSE}
+
+train_df<-train_df %>% 
+  otherify(k=10, mode_rep = F)
+
+sample_size = floor(0.75*nrow(train_df))
+set.seed(1)
+picked = sample(seq_len(nrow(train_df)),size = sample_size)
+train =train_df[picked,]
+test =train_df[-picked,]
+
+#Impute the mode value in train and test for those "other" categories with less than 10 overall predictors
+names<-train_df %>% 
+    select_if(negate(is.numeric)) %>% 
+    names()
+
+
+for (i in 1:length(names)){
+    s<-sum(train_df[[names[i]]]=="other")
+    if ((s!=0)&(s<=10)){
+      train[[names[i]]]=ifelse(train[[names[i]]]=="other",
+                       Mode(train[[names[i]]]),
+                       train[[names[i]]])
+      test[[names[i]]]=ifelse(test[[names[i]]]=="other",
+                       Mode(test[[names[i]]]),
+                       test[[names[i]]])
+    }
+  }
+
+#remove singleton categoricals
+singleton<-character()
+t=1
+# s = number of others in train_df
+# l = number of unique values in train_df
+for (i in 1:length(names)){
+  s<-sum(train_df[[names[i]]]=="other")
+  l<-length(train_df[[names[i]]] %>% unique())
+  if (((s!=0)&(s<=10)&(l==2))|| (l==1)  ){
+    singleton[t]=names[i]
+    t=t+1
+  }
+}
+
+train_df<-train_df %>% 
+  select(-all_of(singleton))
+train<-train %>% 
+  select(-all_of(singleton))
+test<-test %>% 
+  select(-all_of(singleton))
+
+
+#Impute the missing values for MasVnr and Electrical and perform rough fix for GarageYrBlt
+train<-train %>% 
+  mutate(MasVnrType=ifelse(is.na(MasVnrType), "None",MasVnrType)) %>% 
+  mutate(MasVnrArea=ifelse(is.na(MasVnrArea), 0,MasVnrArea)) %>% 
+  mutate(Electrical=ifelse(is.na(Electrical),"SBrkr",Electrical)) %>% mutate( GarageYrBlt = ifelse(is.na(GarageYrBlt), mean(train$GarageYrBlt,na.rm=TRUE), GarageYrBlt))
+
+#Again for the test set, where we checked that the mode is the same
+test<-test %>% 
+  mutate(MasVnrType=ifelse(is.na(MasVnrType), "None",MasVnrType)) %>% 
+  mutate(MasVnrArea=ifelse(is.na(MasVnrArea), 0,MasVnrArea)) %>% 
+  mutate(Electrical=ifelse(is.na(Electrical),"SBrkr",Electrical))%>% mutate( GarageYrBlt = ifelse(is.na(GarageYrBlt), mean(test$GarageYrBlt,na.rm=TRUE), GarageYrBlt))
+
+
+```
+
+# Exploratory
+
+```{r compute cor matrix, echo=FALSE}
+build_cor_mat <- function(df){
+  cor_mat<-df %>% 
+  select_if(is.numeric) %>% 
+  drop_na() %>% 
+  cor()
+
+  n<-nrow(cor_mat)
+  names<-row.names(cor_mat)
+  correlation_tidy<-data.frame(row_name=character(),col_name=character(),corr=character())
+  for(i in 1:n){
+    
+    for (l in i:n){
+      corr<-cor_mat[i,l]
+      row_name<-names[i]
+      col_name<-names[l]
+      
+      df=data.frame(row_name,col_name,corr)
+      correlation_tidy=rbind(correlation_tidy,df)
+    }
+  }
+  return(list(cor_mat, correlation_tidy))
+}
+
+return_list <- build_cor_mat(train_df)
+cor_mat <- return_list[[1]]
+correlation_tidy <- return_list[[2]]
+```
+
+First we can analyze the correlation values between numerical variables. We can see the first few variable pairs with high correlation in the following table, which shows that many predictor variables have a strong linear relation with our response Sale Price. This informs our decision to fit a linear regression model, although we don't anticipate the linear regression model to perform best since the correlation values aren't extremely strong. This also suggests that a more complex model like trees or random forests may perform better at capturing this complex relationship. 
+
+```{r echo=FALSE}
+# Check what has highest (absolute) correlation with sale price
+correlation_tidy %>% 
+  filter(col_name=="SalePrice") %>% 
+  mutate(abs_corr=abs(corr)) %>%   
+  arrange(desc(abs_corr))%>% 
+  select(-abs_corr) %>% 
+  filter(row_name != col_name) %>% 
+  head(6)
+```
+
+If we look at all of the predictor variables' correlation with Sale Price, we can observe some counter-intuitive trends. For example, the fact that Overall Condition is negatively correlated with Sale Price may seem strange since one would anticipate the price to increase as the overall condition of the house improves. However, if we look closely at the plot between Sale Price vs Overall Condition, we can see that this is a consequence of trying to fit a linear model on a discrete numeric variable. This is another indication that linear regression may not be the best choice, and we need a more complex model to capture these type of complex trends. 
+
+```{r fig.height = 3, fig.width=5}
+# Check which has negative correlation
+# What Overall Cond has negative correlation?
+correlation_tidy %>% 
+  filter(col_name=="SalePrice",
+         corr<=0) %>% 
+  mutate(abs_corr=abs(corr)) %>% 
+  arrange(desc(abs_corr))%>% 
+  select(-abs_corr) %>% 
+  head()
+
+# SalePrice vs OverallCond
+ggplot(train, aes(y = SalePrice, x = OverallCond)) + 
+  geom_point() +
+  labs(title = "Sale Price vs Overall Condition")
+```
+
+Next, if we look at the correlation between numeric predictor variables, we will notice that there are many pairs with high correlation. Serious collinearity concerns make fitting a full linear model inadvisable, so we use subset selection methods and LASSO regression methods to address this issue. Tree-based methods, particularly random forests, are also used since they perform better on datasets with correlated predictors. We also try manually removing variables that have over 0.5 correlation and see if that improves the performance of our models. 
+
+```{r echo=FALSE}
+# Correlation between predictors
+correlation_tidy %>% 
+  filter(col_name!="SalePrice",
+         col_name!=row_name) %>% 
+  mutate(abs_corr=abs(corr)) %>% 
+  arrange(desc(abs_corr))%>% 
+  select(-abs_corr) %>% 
+  head()
+```
+
+The categorical variables are also problematic for linear regression, especially since some variables like Neighborhood have 24 different levels. Since linear regression creates dummy variables for each level of a categorical variable, linear regression on this data set will soon create numerous amounts of dummy variables. This will make the linear regression models more expensive to fit and harder to interpret, which further certifies the need of model selection methods. 
+
+```{r echo=FALSE}
+sapply(lapply(train_df %>% select_if(negate(is.numeric)), unique), length)
+```
+
+Finally, we can investigate the distribution of the response variable Sale Price. The distribution is clearly right-skewed with outliers that have extremely high sale price values, so linear regression methods may suffer. Hence we consider a log transformation on the response variable to de-emphasize outliers and obtain a more normally-distributed response variable. Moreover, the residual plots confirm that doing a log transformation produces a residual plot with more constant variance and less skewness. This suggests that taking the log might improve linear model performance. However, we should also beware that the residuals still don't follow a normal distribution even after log transformation, as shown by the Normal QQ plot. 
+
+```{r fig.height = 3, fig.width=5}
+# SalePrice distribution is right skewed
+ggplot(train, aes(x = SalePrice)) + 
+  geom_histogram(color = "white")+
+  labs(title = "Distribution of Sale Price")
+```
+
+
+```{r fig.height = 3, fig.width=5}
+# SalePrice distribution is right skewed
+ggplot(train, aes(x = log10(SalePrice))) + 
+  geom_histogram(color = "white") + 
+  labs(title = "Distribution of Log transformed Sale Price")
+```
+
+```{r echo=FALSE}
+# Taking log solves residual pattern
+full_mod <- glm(SalePrice ~ ., data = train)
+par(mfrow = c(2,2))
+plot(full_mod)
+
+log_mod <- glm(log10(SalePrice) ~ ., data = train)
+plot(log_mod)
+```
+
+# LR with Subset selection
+
+### Reduce data
+
+We compute the correlation matrix and use the findCorrelation function to drop variables that have over 0.5 pair-wise correlation. The way this function chooses which of the pair to drop is by computing its mean correlation value with all other variables, and dropping the one with a higher mean correlation value. We drop these variables in to create reduced train and test sets. The variables dropped are shown below. 
+
+```{r reduce data}
+
+# correlation_tidy %>% 
+#   filter(row_name != col_name) %>% 
+#   filter(col_name != "SalePrice") %>% 
+#   filter(abs(corr) > 0.5) %>% 
+#   arrange(desc(abs(corr)))
+
+# remove correlations with response variable
+new_cor_mat <-cor_mat[rownames(cor_mat) != "SalePrice", colnames(cor_mat) != "SalePrice"]
+
+# Finds pair-wise correlation over 0.5, remove the one with higher mean correlation with other variables
+rm_names <- findCorrelation(new_cor_mat, 0.5, names=T)
+rm_names
+rm_idx <- which(names(train) %in% rm_names)
+
+# reduce train and test data
+red_train = train[, -rm_idx]
+red_test = test[, -rm_idx]
+
+# # Check that reduced train_df has no variables with corr > 0.5
+# red_return_list <- build_cor_mat(red_train_df)
+# red_cor_mat <- red_return_list[[1]]
+# red_correlation_tidy <- red_return_list[[2]]
+# 
+# red_correlation_tidy %>% 
+#   filter(row_name != col_name) %>% 
+#   filter(col_name != "SalePrice") %>% 
+#   arrange(desc(abs(corr)))
+
+# # Check that using train will result in removing the same variables
+# tmp <- train %>% select_if(is.numeric) %>% cor()
+# tmp_cor_mat <-cor_mat[rownames(tmp) != "SalePrice", colnames(tmp) != "SalePrice"]
+# tmp_names <- findCorrelation(tmp_cor_mat, 0.5, names=T, verbose=T)
+# sort(tmp_names) == sort(rm_names)
+```
+
+### Forward Selection
+
+We use forward selection on usual data, reduced data, log-transformed data, and reduced log-transformed data. 
+
+```{r warning=FALSE}
+## R code: Model testing
+forward_mod <- regsubsets(SalePrice ~ ., data = train, nvmax = dim(train)[2], method = "forward")
+forward_mod_red <- regsubsets(SalePrice ~ ., data = red_train, nvmax = dim(train)[2], method = "forward")
+forward_mod_log <- regsubsets(log10(SalePrice) ~ ., data = train, nvmax = dim(train)[2], method = "forward")
+forward_mod_log_red <- regsubsets(log10(SalePrice) ~ ., data = red_train, nvmax = dim(train)[2], method = "forward")
+```
+
+We choose the model with minimum BIC metric value, since all other metrics give the full model as the best model. For example, the forward selection on the usual data gives the following models as the best according to different metrics.  
+```{r }
+# Absolute metrics give full models as best, except bic.min which gives 64-model as best
+adjr2.max <- which.max(summary(forward_mod)$adjr2)
+rss.min <- which.min(summary(forward_mod)$rss)
+cp.min <- which.min(summary(forward_mod)$cp)
+bic.min <- which.min(summary(forward_mod)$bic)
+data.frame(adjr2.max, rss.min, cp.min, bic.min)
+```
+
+Here is a plot of the BIC metric as model complexity increases. We can see that the minimum occurs at 41 variables. 
+```{r fig.height = 3, fig.width=5}
+d <- data.frame(model = 1:(dim(train)[2]+1),
+adjr2 = summary(forward_mod)$adjr2,
+rss = summary(forward_mod)$rss,
+cp = summary(forward_mod)$cp,
+bic = summary(forward_mod)$bic)
+
+ggplot(d, aes(x = model, y = bic)) + 
+  geom_line()
+```
+
+
+
+
+### Backward Selection
+
+Similarly, we use backward selection on four types of data: whether or not it is reduced, and whether or not it is log-transformed. 
+```{r backward, warning=FALSE}
+backward_mod <- regsubsets(SalePrice ~ ., data = train, nvmax = dim(train)[2], method = "backward")
+backward_mod_red <- regsubsets(SalePrice ~ ., data = red_train, nvmax = dim(train)[2], method = "backward")
+backward_mod_log <- regsubsets(log10(SalePrice) ~ ., data = train, nvmax = dim(train)[2], method = "backward")
+backward_mod_log_red <- regsubsets(log10(SalePrice) ~ ., data = red_train, nvmax = dim(train)[2], method = "backward")
+```
+
+We continue to use bic.min as the metric for model selection, since all other metrics give the full model.
+
+```{r}
+b_adjr2.max <- which.max(summary(backward_mod)$adjr2)
+b_rss.min <- which.min(summary(backward_mod)$rss)
+b_cp.min <- which.min(summary(backward_mod)$cp)
+b_bic.min <- which.min(summary(backward_mod)$bic)
+data.frame(b_adjr2.max, b_rss.min, b_cp.min, b_bic.min)
+```
+
+
+```{r fig.height = 3, fig.width=5}
+b_d <- data.frame(model = 1:(dim(train)[2]+1),
+adjr2 = summary(backward_mod)$adjr2,
+rss = summary(backward_mod)$rss,
+cp = summary(backward_mod)$cp,
+bic = summary(backward_mod)$bic)
+
+ggplot(b_d, aes(x = model, y = bic)) + 
+  geom_line()
+```
+
+### Predict
+
+Next we make predictions and compute the test MSE values for each model. 
+
+```{r predict}
+predict.regsubsets = function(object, newdata, id, ...) {
+    form = as.formula(object$call[[2]])
+    mat = model.matrix(form, newdata)
+    coefi = coef(object, id = id)
+    mat[, names(coefi)] %*% coefi
+}
+
+preds_forward <- predict.regsubsets(forward_mod, test, id= which.min(summary(forward_mod)$bic))
+rmse_forward <- mean((test$SalePrice - preds_forward)^2)
+
+preds_forward_red <- predict.regsubsets(forward_mod_red, red_test, id=which.min(summary(forward_mod_red)$bic))
+rmse_forward_red <- mean((test$SalePrice - preds_forward_red)^2)
+
+preds_forward_log <- predict.regsubsets(forward_mod_log, test, id= which.min(summary(forward_mod_log)$bic))
+rmse_forward_log <- mean((test$SalePrice - 10^(preds_forward_log))^2)
+
+preds_forward_log_red <- predict.regsubsets(forward_mod_log_red, red_test, id=which.min(summary(forward_mod_red)$bic))
+rmse_forward_log_red <- mean((test$SalePrice - 10^(preds_forward_log_red))^2)
+
+preds_backward <- predict.regsubsets(backward_mod, test, id= which.min(summary(backward_mod)$bic))
+rmse_backward <- mean((test$SalePrice - preds_backward)^2)
+
+preds_backward_red <- predict.regsubsets(backward_mod_red, red_test, id=which.min(summary(backward_mod_red)$bic))
+rmse_backward_red <- mean((test$SalePrice - preds_backward_red)^2)
+
+preds_backward_log <- predict.regsubsets(backward_mod_log, test, id= which.min(summary(backward_mod_log)$bic))
+rmse_backward_log <- mean((test$SalePrice - 10^(preds_backward_log))^2)
+
+preds_backward_log_red <- predict.regsubsets(backward_mod_log_red, red_test, id=which.min(summary(backward_mod_red)$bic))
+rmse_backward_log_red <- mean((test$SalePrice - 10^(preds_backward_log_red))^2)
+```
+
+
+We can see that both log transformation and reducing the dataset will reduce the test MSE values. This confirms our conjecture in the exploratory state that these methods will improve model performance. Overall, backward selection seems to outperform forward selection. Hence backward selection on log-transformed reduced data performs the best linear regression. 
+
+```{r}
+lr_out <- data.frame(Algorithm = c("Forward", "Forward Reduced", "Forward Log", "Forward Log Reduced",
+                     "Backward", "Backward Reduced", "Backward Log", "Backward Log Reduced"),
+           Test_MSE = c(rmse_forward, rmse_forward_red, rmse_forward_log, rmse_forward_log_red,
+                   rmse_backward, rmse_backward_red, rmse_backward_log, rmse_backward_log_red)) %>% 
+  mutate(Test_RMSE = sqrt(Test_MSE))
+
+lr_out %>%
+  pander::pander()
+```
+
+# Lasso regression
+
+We apply lasso regression on both usual and logged data.  
+
+```{r fig.height = 3, fig.width=5}
+set.seed(1)
+
+x<-model.matrix(SalePrice ~., data = train)[,-1]
+y<-train$SalePrice
+
+logx<-model.matrix(log10(SalePrice) ~., data = train)[,-1]
+logy<-log10(train$SalePrice)
+
+grid = 10^(seq( -3, 5, length = 100))
+lasso_cv<-cv.glmnet(x,y,alpha=1,lambda=grid,nfolds=10)
+log_lasso_cv<-cv.glmnet(logx,logy,alpha=1,lambda=grid,nfolds=10)
+plot(lasso_cv)
+```
+
+For our optimal $\lambda$ values, we take the $\lambda$ values that minimizes CV error:
+
+```{r}
+min_L= lasso_cv$lambda.min
+log_min_L = log_lasso_cv$lambda.min
+```
+
+We fit our LASSO and LASSO Log models with the optimal parameter:
+```{r}
+lasso_mod<-glmnet(x,y,alpha=1,lambda=grid,nfolds=10)
+test_mat<-model.matrix(SalePrice ~., data = test)[,-1]
+lasso_pred<-predict(lasso_mod,s=min_L, newx=test_mat)
+
+log_lasso_mod<-glmnet(logx,logy,alpha=1,lambda=grid,nfolds=10)
+log_test_mat<-model.matrix(log10(SalePrice) ~., data = test)[,-1]
+log_lasso_pred<-predict(log_lasso_mod,s=log_min_L, newx=log_test_mat)
+```
+
+We see that for LASSO, the log transformation also improves test MSE. We thus choose the logged model for LASSO.
+```{r}
+test_TV<-test$SalePrice
+lasso_MSE<-mean((test_TV-lasso_pred)^2)
+log_lasso_MSE<-mean((test_TV-10^(log_lasso_pred))^2)
+ 
+lasso_out <- data.frame(Algorithm=c("LASSO", "LASSO Log"),Test_MSE=c(lasso_MSE, log_lasso_MSE)) %>%
+  mutate(Test_RMSE=sqrt(Test_MSE))%>% 
+  arrange(desc(Test_MSE))
+
+lasso_out %>% pander::pander()
+```
+
+# Tree-based methods
+
+### Training
+
+ Next we train our regression trees. We start with a single pruned decision tree. First we train the full tree:
+
+```{r}
+set.seed(1)
+T0<-rpart(SalePrice~., data=train, 
+             control = rpart.control(cp=0))
+```
+
+
+Next, we pick the maximum value of CP that has $X$-relative error within one standard deviation of the mean. This value balances performance and complexity. This value of CP is given below:
+
+```{r}
+
+cptable<-T0$cptable %>% as.data.frame()
+
+
+p.rpart <- T0$cptable
+xstd <- p.rpart[, 5L]
+    xerror <- p.rpart[, 4L]
+minpos <- min(seq_along(xerror)[xerror == min(xerror)])
+thresh<-(xerror + xstd)[minpos]
+
+
+best_cp<-cptable %>% 
+  filter(xerror<=thresh) %>% 
+  filter(CP==max(CP)) %>% 
+  select(CP) %>% 
+  pull()
+  
+```
+
+Now we prune our tree with the optimal CP value to make our final tree:
+
+```{r}
+pruned<-prune(T0,best_cp)
+```
+
+
+Now that the pruned regression tree has been fit, we move on to bagged and random forests:
+
+First we fit the bagged tree, letting `mtry` be equal to the number of predictors:
+```{r cache=TRUE}
+set.seed(1)
+bag<-randomForest(SalePrice~.,
+                       mtry=ncol(train)-1,
+                       data=train,
+                       importance=T)
+```
+
+Now we fit the random forest. Here we set `mtry` equal to the default number for a random forest for regression ($p/3$).
+
+```{r}
+set.seed(1)
+rf<-randomForest(SalePrice~.,
+                       mtry=(ncol(train)-1)/3,
+                       data=train,
+                       importance=T)
+```
+
+### Prediction
+
+Now we extract predictions on test data and create a table of MSEs for each model.
+
+```{r}
+
+
+#Tree preds
+test_Tree_pred<-predict(pruned,newdata = test
+                          )
+
+#RF
+test_rf_preds<-predict(rf,test)
+
+#Bagged
+test_bag_preds<-predict(bag,test)
+
+#True values
+test_TV<-test$SalePrice
+```
+
+
+
+```{r}
+# Get MSEs for Trees
+tree_MSE<-mean((test_TV-test_Tree_pred)^2)
+rf_MSE<-mean((test_TV-test_rf_preds)^2)
+bag_MSE<-mean((test_TV-test_bag_preds)^2)
+
+tree_out <- data.frame(Algorithm=c("Pruned Tree","Bagged Forest", "Random Forest"),Test_MSE=c(tree_MSE,bag_MSE,rf_MSE)) %>% 
+
+mutate(Test_RMSE=sqrt(Test_MSE))
+
+tree_out %>% 
+  pander::pander()
+```
+
+Among trees, random forest performs the best and the pruned tree performs the worst. The fact that the pruned tree performs worse than the other two trees makes sense since pruned trees are notorious for overfitting. The random forest also performs about 1% better than the bagged tree. Whether this increase in performance is significant is subject to debate, but we would expect a random forest to outperform a bagged tree on these data. This is because, returning to our EDA, many of the predictors in this dataset are highly correlated, which means that a bagged tree, which has access to all of the predictors at every step, might systematically choose nonoptimal trees due to its greedy selection algorithm. In addition to predictions, the random forest also gives us access to variable importance data which we investigate now.
+
+
+```{r}
+imp<-importance(rf) %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  rename("Predictor"=rowname) %>% 
+  arrange(desc(`%IncMSE`))
+
+imp[1:15,] %>% 
+  mutate(Predictor = fct_reorder(Predictor, `%IncMSE`)) %>% 
+  ggplot( mapping=aes(x=Predictor,y=`%IncMSE`))+
+  geom_col(color="white",fill="steelblue")+
+  coord_flip()+
+  labs(title="Change in error when predictors are removed",y="Percent Increase in MSE")
+
+```
+
+Here the metric printed in the table is the percent increase in out of bag MSE when the values of a predictor are permuted. This metric provides a fairly robust estimate of the relative importance of predictors in our dataframe. Far and away the most important predictor is General Living Area. After that the next most important predictor is Overall Quality, a rating of the overall material and finish of the house on a scale one to ten. Year Built comes in 4th place, and many of the remaining important predictors have to do with the floor area and quality of various parts of the house. In general, it seems that the key factors in determining house price seem to be size, quality of material and finish, and the age of the home. Two other interesting important predictors are `Neighborhood` and `MSZoning`. Neighborhood is self explanatory, but `MSZoning` pertains to the general zoning classification of the sale (ie Commercial, Agricultural, Residential High Density, and so on). The importance of this variable seems to indicate that differently zoned transactions have different Sale Prices.
+
+
+# Compare all methods
+
+```{r}
+rbind(
+lr_out %>% filter(Algorithm == "Backward Log Reduced"),
+lasso_out  %>% filter(Algorithm == "LASSO Log"),
+tree_out  %>% filter(Algorithm == "Random Forest")) %>% 
+  arrange(Test_RMSE)
+```
+
+```{r}
+(25641.47 - 25122.14)/25641.47
+```
+
+From the table we see that the Random Forest model outperforms all other models with RMSE 25122.14. Noted that LASSO Log model only has a 2% higher RMSE than the Random Forest. Given the large number of predictors, it's surprising how good LASSO Log performs against random forest. If the problem is inference instead of prediction, LASSO Log is preferred to perform variable selection.
+
+Here we can easily print out the variables/levels selected by the lasso model with top 15 highest coefficients:
+```{r}
+s <- which(lasso_mod$lambda==min_L)
+coef <- data.frame(coef = coef(lasso_mod)[,s]) %>%
+  arrange(desc(coef)) %>%
+  head(15)
+coef
+```
